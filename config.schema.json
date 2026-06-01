@@ -1,0 +1,81 @@
+{
+  "pluginAlias": "echonet-light",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": false,
+  "schema": {
+    "type": "object",
+    "required": ["name"],
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "description": "Display name for this platform instance in Homebridge.",
+        "type": "string",
+        "default": "ECHONET Light"
+      },
+      "ipVersion": {
+        "title": "IP Version",
+        "description": "IP stack to use for ECHONET Lite communication. 0 = dual-stack, 4 = IPv4 only (default), 6 = IPv6 only.",
+        "type": "integer",
+        "default": 4,
+        "oneOf": [
+          { "title": "Dual-stack (IPv4 + IPv6)", "enum": [0] },
+          { "title": "IPv4 only (default)",      "enum": [4] },
+          { "title": "IPv6 only",                "enum": [6] }
+        ]
+      },
+      "discoveryInterval": {
+        "title": "Discovery Interval (seconds)",
+        "description": "How often (in seconds) the plugin re-runs device discovery. Minimum 10 seconds.",
+        "type": "integer",
+        "default": 300,
+        "minimum": 10
+      },
+      "pollInterval": {
+        "title": "State Poll Interval (seconds)",
+        "description": "How often (in seconds) the plugin polls each known device for its current state, as a fallback for missed live updates. Minimum 1 second.",
+        "type": "integer",
+        "default": 5,
+        "minimum": 1
+      },
+      "synchroColourTone": {
+        "title": "Synchro Colour Tone",
+        "description": "When true, dimmable devices expose a colour temperature characteristic linked to brightness for use with Panasonic Synchro Colour Tone flat lamps.",
+        "type": "boolean",
+        "default": false
+      },
+      "_bridge": {
+        "title": "Child Bridge Settings",
+        "description": "Homebridge-managed child bridge configuration. Do not edit manually.",
+        "type": "object"
+      },
+      "devices": {
+        "title": "Device Overrides",
+        "description": "Per-device configuration overrides.",
+        "type": "array",
+        "default": [],
+        "minItems": 0,
+        "items": {
+          "title": "Device",
+          "type": "object",
+          "required": ["serialNumber"],
+          "additionalProperties": false,
+          "properties": {
+            "serialNumber": {
+              "title": "Serial Number",
+              "description": "The serial number of the device to override. Find this value in the Homebridge UI by opening the accessory's details panel and copying the 'Serial Number' field, or in the Homebridge log when the device is discovered or loaded from cache.",
+              "type": "string"
+            },
+            "synchroColourTone": {
+              "title": "Synchro Colour Tone",
+              "description": "Overrides the global Synchro Colour Tone setting for this specific device.",
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

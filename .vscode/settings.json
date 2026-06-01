@@ -1,0 +1,12 @@
+{
+  "files.eol": "\n",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "editor.rulers": [
+    140
+  ],
+  "eslint.enable": true,
+  "typescript.format.indentSwitchCase": false,
+  "javascript.format.indentSwitchCase": false
+}
