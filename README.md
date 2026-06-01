@@ -4,6 +4,8 @@
 
 A [Homebridge](https://homebridge.io/) plugin for controlling [ECHONET Lite](https://echonet.jp/features_en/) lighting devices.
 
+[![npm](https://img.shields.io/npm/dt/homebridge-echonet-light)](https://www.npmjs.com/package/homebridge-echonet-light)  
+
 </span>
 
 ## Disclaimer
@@ -83,4 +85,4 @@ Panasonic offers [synchro colour tone](https://sumai.panasonic.jp/lighting/home/
 directly in relation to the dimmer brightness setting. When `synchroColourTone` is `true`, the plugin exposes a HomeKit color temperature
 characteristic directly linked to brightness so when either the temperature or brightness controls are adjust the other moves in unison.
 This setting attempts to match the colour temperature and brightness curve that is applied within the lamp so that the colour temperature
-can be set andpo tentially support adaptive lighting in Apple Home.
+can be set and potentially support adaptive lighting in Apple Home.

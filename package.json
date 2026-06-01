@@ -4,7 +4,7 @@
   "type": "module",
   "version": "1.0.0",
   "private": false,
-  "description": "A Homebridge plugin for controlling EchoneECHONETt Lite lighting devices.",
+  "description": "A Homebridge plugin for controlling ECHONET Lite lighting devices.",
   "author": "Vaughan Whitteron",
   "license": "Apache-2.0",
   "homepage": "https://github.com/vwhitteron/homebridge-echonet-light#readme",
