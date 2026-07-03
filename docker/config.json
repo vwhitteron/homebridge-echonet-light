@@ -1,0 +1,23 @@
+{
+    "bridge": {
+        "name": "ECHONET Light",
+        "username": "0E:11:22:33:44:55",
+        "port": 51826,
+        "pin": "031-45-154"
+    },
+    "accessories": [],
+    "platforms": [
+        {
+            "name": "Config",
+            "port": 8581,
+            "platform": "config"
+        },
+        {
+            "name": "ECHONET Light",
+            "platform": "echonet-light",
+            "ipVersion": 4,
+            "refreshInterval": 60,
+            "synchroColourTone": true
+        }
+    ]
+}
