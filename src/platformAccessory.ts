@@ -1,7 +1,7 @@
 import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
 
 import type { PropertyChange } from './echonet/client.js';
-import { createColourTemperatureCurve, type ColourTemperatureCurveImpl } from './echonet/colorTemperature.js';
+import { createColourTemperatureCurve, miredToKelvin, type ColourTemperatureCurveImpl } from './echonet/colorTemperature.js';
 import { MANUFACTURERS } from './echonet/manufacturers.js';
 import type { AccessoryContext, EchonetLightPlatform } from './platform.js';
 import {
@@ -9,15 +9,24 @@ import {
   EDT_ON,
   EPC,
   LEVEL_MAX,
+  UPDATE_SETTLE_MS,
 } from './settings.js';
 
 /**
  * Brightness and colour temperature are both backed by the single ILLUMINANCE_LEVEL property, so a
  * slider drag fires a burst of onSet calls. We coalesce them into one write after the drag settles,
- * and ignore the device's echo of our own value for a short window so it doesn't yank the slider.
+ * and ignore device updates for the UPDATE_SETTLE_MS window afterwards so they don't yank the slider.
  */
 const LEVEL_WRITE_DEBOUNCE_MS = 250;
-const ECHO_SUPPRESS_MS = 1500;
+
+/** Which inbound path delivered a device update — for log attribution only. */
+type UpdateSource = 'poll' | 'notify';
+
+/** Origin prefix for directional state-sync log lines (`{actor} -> {device} …`). */
+const ACTOR = {
+  HOMEBRIDGE: 'Homebridge',
+  ECHONET: 'ECHONET',
+} as const;
 
 /** A single-byte level EDT (0x00–0x64) → 0–100. */
 function edtToLevel(edt: string): number {
@@ -78,14 +87,20 @@ function decodeFirmwareRevision(productionNumber: string | undefined, production
 export class EchonetLightAccessory {
   private readonly ctx: AccessoryContext;
   private readonly service: Service;
-  private readonly isLightbulb: boolean;
+  private readonly isDimmable: boolean;
   private readonly hasColorTemperature: boolean;
   private readonly ctCurve: ColourTemperatureCurveImpl;
 
   /** Debounce state for coalescing brightness/colour-temperature writes (see module header). */
   private pendingLevel?: number;
   private levelWriteTimer?: ReturnType<typeof setTimeout>;
-  private suppressEchoUntil = 0;
+  private suppressLevelUntil = 0;
+  private suppressOnUntil = 0;
+
+  /** True while a level write is debouncing or its update-suppression window is still open. */
+  private get levelWriteInFlight(): boolean {
+    return this.levelWriteTimer !== undefined || Date.now() < this.suppressLevelUntil;
+  }
 
   constructor(
     private readonly platform: EchonetLightPlatform,
@@ -98,15 +113,15 @@ export class EchonetLightAccessory {
 
     this.setAccessoryInformation();
 
-    this.isLightbulb =
+    this.isDimmable =
       client.supportsProperty(ip, eoj, EPC.ILLUMINANCE_LEVEL) ||
       client.supportsProperty(ip, eoj, EPC.MAX_SPECIFIABLE_ILLUMINANCE_LEVEL);
     // Colour temperature is derived from brightness, so it only applies to dimmable lights.
-    this.hasColorTemperature = this.isLightbulb && this.ctx.synchroColourTone;
+    this.hasColorTemperature = this.isDimmable && this.ctx.synchroColourTone;
 
     const { Service, Characteristic } = this.platform;
 
-    if (this.isLightbulb) {
+    if (this.isDimmable) {
       this.service = this.accessory.getService(Service.Lightbulb)
         ?? this.accessory.addService(Service.Lightbulb);
       this.removeService(Service.Switch);
@@ -122,7 +137,7 @@ export class EchonetLightAccessory {
       .onGet(this.getOn.bind(this))
       .onSet(this.setOn.bind(this));
 
-    if (this.isLightbulb) {
+    if (this.isDimmable) {
       this.service.getCharacteristic(Characteristic.Brightness)
         .onGet(this.getBrightness.bind(this))
         .onSet(this.setBrightness.bind(this));
@@ -181,43 +196,32 @@ export class EchonetLightAccessory {
 
   /** Fetch current device state and push it to HomeKit — used at startup and on periodic polls. */
   async refreshState(): Promise<void> {
-    const { Characteristic } = this.platform;
     const name = this.accessory.displayName;
+    const source: UpdateSource = 'poll';
 
-    this.platform.log.debug(`[${name}] refreshState: polling device`);
+    this.platform.log.debug(`${ACTOR.HOMEBRIDGE} [${source}] -> ${name} reading device state`);
 
     const [statusEdt, levelEdt] = await Promise.all([
       this.read(EPC.OPERATION_STATUS),
-      this.isLightbulb ? this.read(EPC.ILLUMINANCE_LEVEL) : Promise.resolve(undefined),
+      this.isDimmable ? this.read(EPC.ILLUMINANCE_LEVEL) : Promise.resolve(undefined),
     ]);
 
     if (statusEdt !== undefined) {
       const on = statusEdt.toLowerCase() === EDT_ON;
-      const currentOn = this.service.getCharacteristic(Characteristic.On).value;
-      if (on !== currentOn) {
-        this.platform.log.debug(`[${name}] refreshState: on changed ${currentOn} → ${on}`);
-        this.service.updateCharacteristic(Characteristic.On, on);
+      if (this.applyOn(on, source)) {
+        this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} state set to ${on ? 'ON' : 'OFF'}`);
       }
     } else {
-      this.platform.log.debug(`[${name}] refreshState: no response for OPERATION_STATUS`);
+      this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} no response for OPERATION_STATUS`);
     }
 
     if (levelEdt !== undefined) {
-      // Don't overwrite a value the user is actively setting.
-      const isWritePending = this.levelWriteTimer !== undefined || Date.now() < this.suppressEchoUntil;
-      if (isWritePending) {
-        this.platform.log.debug(`[${name}] refreshState: skipping ILLUMINANCE_LEVEL update (write in progress)`);
-      } else {
-        const level = edtToLevel(levelEdt);
-        const currentLevel = this.service.getCharacteristic(Characteristic.Brightness).value;
-        if (level !== currentLevel) {
-          this.platform.log.debug(`[${name}] refreshState: level changed ${currentLevel} → ${level}%`);
-          this.service.updateCharacteristic(Characteristic.Brightness, level);
-          this.syncColorTemperature(level);
-        }
+      const level = edtToLevel(levelEdt);
+      if (this.applyLevel(level, source)) {
+        this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} brightness set to ${level}%`);
       }
-    } else if (this.isLightbulb) {
-      this.platform.log.debug(`[${name}] refreshState: no response for ILLUMINANCE_LEVEL`);
+    } else if (this.isDimmable) {
+      this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} no response for ILLUMINANCE_LEVEL`);
     }
   }
 
@@ -226,33 +230,21 @@ export class EchonetLightAccessory {
     if (change.ip !== this.ctx.ip || change.eoj.toLowerCase() !== this.ctx.eoj.toLowerCase()) {
       return;
     }
-    const { Characteristic } = this.platform;
+    const name = this.accessory.displayName;
+    const source: UpdateSource = 'notify';
     switch (change.epc) {
     case EPC.OPERATION_STATUS: {
       const on = change.edt.toLowerCase() === EDT_ON;
-      this.platform.log.info(`[${this.accessory.displayName}] on changed → ${on}`);
-      this.service.updateCharacteristic(Characteristic.On, on);
+      if (this.applyOn(on, source)) {
+        this.platform.log.info(`${ACTOR.ECHONET} [${source}] -> ${name} state set to ${on ? 'ON' : 'OFF'}`);
+      }
       break;
     }
     case EPC.ILLUMINANCE_LEVEL:
-      if (this.isLightbulb) {
+      if (this.isDimmable) {
         const level = edtToLevel(change.edt);
-        // While a write is pending or we're inside the echo-suppression window, the value the user
-        // just set is authoritative. Ignore *any* incoming level report in that window — not just
-        // exact echoes — because devices often emit a stale/transient report (e.g. 0%) mid-drag that
-        // would otherwise shove the brightness/colour-temperature sliders around.
-        const isOwnEcho =
-          this.levelWriteTimer !== undefined || Date.now() < this.suppressEchoUntil;
-        if (isOwnEcho) {
-          this.platform.log.debug(
-            `[${this.accessory.displayName}] brightness change suppressed (own echo): level=${level}%`,
-          );
-        } else {
-          this.platform.log.info(
-            `[${this.accessory.displayName}] brightness changed → ${level}%`,
-          );
-          this.service.updateCharacteristic(Characteristic.Brightness, level);
-          this.syncColorTemperature(level);
+        if (this.applyLevel(level, source)) {
+          this.platform.log.info(`${ACTOR.ECHONET} [${source}] -> ${name} brightness set to ${level}%`);
         }
       }
       break;
@@ -266,6 +258,51 @@ export class EchonetLightAccessory {
     }
   }
 
+  /**
+   * Push a device-reported on/off state to HomeKit's On characteristic, returning whether it was
+   * applied. Skips while our own write is still settling (suppressOnUntil) or the value is unchanged.
+   */
+  private applyOn(on: boolean, source: UpdateSource): boolean {
+    const { Characteristic } = this.platform;
+    const name = this.accessory.displayName;
+    if (Date.now() < this.suppressOnUntil) {
+      this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} skipping OPERATION_STATUS update (recent write): ${on ? 'ON' : 'OFF'}`);
+      return false;
+    }
+    if (on === this.service.getCharacteristic(Characteristic.On).value) {
+      return false;
+    }
+    this.service.updateCharacteristic(Characteristic.On, on);
+    return true;
+  }
+
+  /**
+   * Push a device-reported level to HomeKit's Brightness (and derived ColorTemperature), returning
+   * whether it was applied. Skips when the user's own write is still in flight, when the equivalent
+   * value is already set, or when the light is off — a powered-off device reports level 0, which we
+   * ignore so HomeKit retains the previous brightness to restore on power-on. `source` only labels
+   * the suppression log line.
+   */
+  private applyLevel(level: number, source: UpdateSource): boolean {
+    const { Characteristic } = this.platform;
+    const name = this.accessory.displayName;
+    const isOff = !this.service.getCharacteristic(Characteristic.On).value;
+    if (this.levelWriteInFlight || isOff) {
+      const reason = this.levelWriteInFlight ? 'write in progress' : 'device off';
+      this.platform.log.debug(
+        `${ACTOR.ECHONET} [${source}] -> ${name} skipping ILLUMINANCE_LEVEL update (${reason}): level=${level}%`,
+      );
+      return false;
+    }
+    const currentLevel = this.service.getCharacteristic(Characteristic.Brightness).value;
+    if (level === currentLevel) {
+      return false;
+    }
+    this.service.updateCharacteristic(Characteristic.Brightness, level);
+    this.syncColorTemperature(level);
+    return true;
+  }
+
   private async getOn(): Promise<CharacteristicValue> {
     const edt = await this.read(EPC.OPERATION_STATUS);
     return edt?.toLowerCase() === EDT_ON;
@@ -273,7 +310,12 @@ export class EchonetLightAccessory {
 
   private async setOn(value: CharacteristicValue) {
     const on = value as boolean;
-    this.platform.log.info(`[${this.accessory.displayName}] set on=${on}`);
+    this.platform.log.info(`${ACTOR.HOMEBRIDGE} -> ${this.accessory.displayName} state set to ${on ? 'ON' : 'OFF'}`);
+    this.suppressOnUntil = Date.now() + UPDATE_SETTLE_MS;
+    // Powering off makes the device report ILLUMINANCE_LEVEL=0. Arm the level window too, in case
+    // HomeKit's On characteristic hasn't flipped to false yet when that report lands — belt-and-
+    // suspenders with the device-off guard in applyLevel.
+    this.suppressLevelUntil = Date.now() + UPDATE_SETTLE_MS;
     this.write(EPC.OPERATION_STATUS, on ? EDT_ON : EDT_OFF);
   }
 
@@ -285,7 +327,7 @@ export class EchonetLightAccessory {
   private async setBrightness(value: CharacteristicValue) {
     const level = value as number;
     this.platform.log.info(
-      `[${this.accessory.displayName}] brightness set → ${level}%`,
+      `${ACTOR.HOMEBRIDGE} -> ${this.accessory.displayName} brightness set to ${level}%`,
     );
     this.queueLevelWrite(level);
     // Deliberately do NOT push a derived ColorTemperature here. Brightness and CT are one device
@@ -305,7 +347,7 @@ export class EchonetLightAccessory {
     // ILLUMINANCE_LEVEL — so drive brightness via the inverse curve.
     const level = this.ctCurve.miredToPercent(mired);
     this.platform.log.info(
-      `[${this.accessory.displayName}] colour temperature set → ${mired} mired (brightness level=${level}%)`,
+      `${ACTOR.HOMEBRIDGE} -> ${this.accessory.displayName} temperature set to ${mired} mired (${Math.round(miredToKelvin(mired))}K)`,
     );
     this.queueLevelWrite(level);
     // Deliberately do NOT push a derived Brightness (or snap CT) here. Those optimistic cross-updates
@@ -315,7 +357,7 @@ export class EchonetLightAccessory {
 
   /**
    * Coalesce a burst of brightness/colour-temperature changes into a single ILLUMINANCE_LEVEL write
-   * once the slider settles, and arm echo suppression so the device's confirmation of our own value
+   * once the slider settles, and arm update suppression so the device's confirmation of our own value
    * doesn't snap the sliders back. See the module header.
    */
   private queueLevelWrite(level: number) {
@@ -326,7 +368,7 @@ export class EchonetLightAccessory {
     this.levelWriteTimer = setTimeout(() => {
       this.levelWriteTimer = undefined;
       const value = this.pendingLevel!;
-      this.suppressEchoUntil = Date.now() + ECHO_SUPPRESS_MS;
+      this.suppressLevelUntil = Date.now() + UPDATE_SETTLE_MS;
       this.platform.log.debug(
         `[${this.accessory.displayName}] writing ILLUMINANCE_LEVEL to device: level=${value}% (EDT 0x${levelToEdt(value)})`,
       );
