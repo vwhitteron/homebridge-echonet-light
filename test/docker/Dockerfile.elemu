@@ -1,0 +1,15 @@
+# KAIT-HEMS ECHONET Lite device emulator (elemu), pinned for reproducible tests.
+# Inside a container the only non-internal interface is eth0, so elemu binds the
+# container's bridge IP automatically — no patching required.
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN git clone --depth 1 https://github.com/KAIT-HEMS/elemu.git
+WORKDIR /opt/elemu
+RUN npm install --omit=dev
+
+EXPOSE 3610/udp 8880/tcp
+CMD ["node", "index.js"]

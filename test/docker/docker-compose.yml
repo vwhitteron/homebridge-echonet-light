@@ -1,0 +1,39 @@
+# Isolated end-to-end test for homebridge-echonet-light.
+#
+# Two containers on a dedicated bridge network: the KAIT-HEMS elemu emulator and a
+# harness that drives the plugin's EchonetClient. Each container has its own IP, so
+# there is no UDP/3610 conflict, and ECHONET multicast (224.0.23.0) stays on the
+# bridge — it never reaches (or hears) real devices on the host's LAN.
+#
+# Run from the repo root:  docker compose -f test/docker/docker-compose.yml up --build --abort-on-container-exit
+services:
+  elemu:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.elemu
+    networks:
+      - echonet
+    ports:
+      - "8880:8880"   # elemu dashboard, browse at http://localhost:8880 to toggle the light by hand
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8880/api/device/eojs"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  harness:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.harness
+    environment:
+      ELEMU_HOST: elemu          # resolved on the bridge network
+      ELEMU_DASHBOARD: http://elemu:8880
+    depends_on:
+      elemu:
+        condition: service_healthy
+    networks:
+      - echonet
+
+networks:
+  echonet:
+    driver: bridge
