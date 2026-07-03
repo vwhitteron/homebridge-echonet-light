@@ -54,6 +54,15 @@ export const DEFAULT_POLL_INTERVAL = 5;
 export const DEFAULT_INITIAL_SCAN_DELAY_MS = 1000;
 
 /**
+ * How long a write takes to settle on the device: the period after we set a value during which the
+ * device keeps emitting traffic about it (the trailing SET_RES/INF confirmation, plus any stale or
+ * transient reports). Both suppression layers derive their window from this single budget — the
+ * client dedups the confirming INF within it, and the accessory ignores incoming updates within it
+ * so our just-written value stays authoritative and the sliders don't get yanked.
+ */
+export const UPDATE_SETTLE_MS = 2500;
+
+/**
  * Colour-temperature curve breakpoints. Colour temperature is a HomeKit-only relationship derived
  * from brightness (the lamp manages its own colour temperature internally); it is not backed by any
  * ECHONET property. Brightness percent → Kelvin: convex from 0–90 %, then linear from 90–100 %.

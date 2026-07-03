@@ -5,7 +5,7 @@ import EL from 'echonet-lite';
 import type { ELDATA } from 'echonet-lite';
 import type { Logging } from 'homebridge';
 
-import { CONTROLLER_EOJ, EPC, LIGHTING_CLASSES } from '../settings.js';
+import { CONTROLLER_EOJ, EPC, LIGHTING_CLASSES, UPDATE_SETTLE_MS } from '../settings.js';
 
 /** A lighting device object located on the network. */
 export interface DiscoveredDevice {
@@ -34,12 +34,6 @@ export interface EchonetClientEvents {
 }
 
 const toHex = (byte: number): string => byte.toString(16).padStart(2, '0');
-
-/**
- * A write produces an optimistic change (from SET_RES) and then an authoritative INF. Suppress
- * the INF when it carries the same value within this window so HomeKit only sees one update.
- */
-const CHANGE_DEDUP_WINDOW_MS = 2500;
 
 function hexToBytes(hex: string): number[] {
   const bytes: number[] = [];
@@ -251,20 +245,20 @@ export class EchonetClient extends EventEmitter<EchonetClientEvents> {
 
   /**
    * Emit a change event with deduplication. Records the key so a subsequent frame carrying the
-   * same (ip, eoj, epc, edt) within CHANGE_DEDUP_WINDOW_MS is suppressed — preventing the INF
+   * same (ip, eoj, epc, edt) within UPDATE_SETTLE_MS is suppressed — preventing the INF
    * that follows a write from producing a second HomeKit update after the optimistic one.
    */
   private emitChange(change: PropertyChange): void {
     const key = `${change.ip}:${change.eoj}:${change.epc}:${change.edt}`;
     const now = Date.now();
     const last = this.recentChanges.get(key) ?? 0;
-    if (now - last < CHANGE_DEDUP_WINDOW_MS) {
+    if (now - last < UPDATE_SETTLE_MS) {
       return;
     }
     this.recentChanges.set(key, now);
     // Evict stale entries to keep the map bounded.
     if (this.recentChanges.size > 500) {
-      const cutoff = now - CHANGE_DEDUP_WINDOW_MS;
+      const cutoff = now - UPDATE_SETTLE_MS;
       for (const [k, ts] of this.recentChanges) {
         if (ts < cutoff) {
           this.recentChanges.delete(k);
