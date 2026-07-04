@@ -29,7 +29,14 @@ export interface SetAck {
 }
 
 export interface EchonetClientEvents {
+  /** Deduplicated, HomeKit-facing state change — routed to accessory handlers. */
   change: [PropertyChange];
+  /**
+   * Raw property value from a GET_RES/INF frame, emitted before dedup. Pending {@link getProperty}
+   * reads listen on this so a probe always resolves on the device's reply, even when {@link emitChange}
+   * would suppress the equivalent `change` (e.g. a GET_RES that echoes a value seen moments earlier).
+   */
+  response: [PropertyChange];
   setack: [SetAck];
 }
 
@@ -164,11 +171,25 @@ export class EchonetClient extends EventEmitter<EchonetClientEvents> {
   /**
    * Read a property. Returns the cached value immediately if present, otherwise issues a GET and
    * waits for the matching GET_RES frame (with a timeout).
+   *
+   * `forceRefresh` turns this into a liveness probe: it bypasses the cache (always sends the GET on
+   * the wire) and resolves to `undefined` on timeout instead of falling back to the stale cached
+   * value, so the caller can tell "device answered" apart from "device silent". Because the
+   * `echonet-lite` cache is never invalidated, a plain cached read cannot detect an offline device.
    */
-  async getProperty(ip: string, eoj: string, epc: string, timeoutMs = 1500): Promise<string | undefined> {
-    const cached = this.getCached(ip, eoj, epc);
-    if (cached !== undefined) {
-      return cached;
+  async getProperty(
+    ip: string,
+    eoj: string,
+    epc: string,
+    timeoutMs = 1500,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<string | undefined> {
+    const forceRefresh = opts?.forceRefresh === true;
+    if (!forceRefresh) {
+      const cached = this.getCached(ip, eoj, epc);
+      if (cached !== undefined) {
+        return cached;
+      }
     }
     const target = epc.toLowerCase();
     // Coalesce concurrent reads of the same property. A colour-temperature light exposes both
@@ -186,17 +207,19 @@ export class EchonetClient extends EventEmitter<EchonetClientEvents> {
       const onChange = (change: PropertyChange) => {
         if (change.ip === ip && change.eoj.toLowerCase() === eoj.toLowerCase() && change.epc === target) {
           clearTimeout(timer);
-          this.off('change', onChange);
+          this.off('response', onChange);
           this.inflightGets.delete(key);
           resolve(change.edt);
         }
       };
       timer = setTimeout(() => {
-        this.off('change', onChange);
+        this.off('response', onChange);
         this.inflightGets.delete(key);
-        resolve(this.getCached(ip, eoj, epc));
+        // A liveness probe reports silence as `undefined`; a normal read falls back to the last
+        // cached value so a single lost packet doesn't surface as a missing property.
+        resolve(forceRefresh ? undefined : this.getCached(ip, eoj, epc));
       }, timeoutMs);
-      this.on('change', onChange);
+      this.on('response', onChange);
       EL.sendOPC1(ip, CONTROLLER_EOJ, eoj, EL.GET, epc, '');
     });
     this.inflightGets.set(key, request);
@@ -293,10 +316,13 @@ export class EchonetClient extends EventEmitter<EchonetClientEvents> {
         this.emit('setack', { ip, eoj, epc: epc.toLowerCase() });
       }
     } else {
-      // GET_RES (0x72) and INF (0x73) carry actual current values; surface them as change events
-      // so pending reads resolve and HomeKit stays in sync with out-of-band state changes.
+      // GET_RES (0x72) and INF (0x73) carry actual current values. Emit `response` first (raw, so a
+      // pending read/probe always resolves on the device's reply) then `change` via emitChange (deduped,
+      // so HomeKit isn't updated twice for the same value).
       for (const [epc, edt] of Object.entries(els.DETAILs)) {
-        this.emitChange({ ip, eoj, epc: epc.toLowerCase(), edt });
+        const change = { ip, eoj, epc: epc.toLowerCase(), edt };
+        this.emit('response', change);
+        this.emitChange(change);
       }
     }
   }

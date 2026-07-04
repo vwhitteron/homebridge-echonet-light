@@ -9,6 +9,7 @@ import {
   EDT_ON,
   EPC,
   LEVEL_MAX,
+  UNREACHABLE_PROBE_THRESHOLD,
   UPDATE_SETTLE_MS,
 } from './settings.js';
 
@@ -96,6 +97,14 @@ export class EchonetLightAccessory {
   private levelWriteTimer?: ReturnType<typeof setTimeout>;
   private suppressLevelUntil = 0;
   private suppressOnUntil = 0;
+
+  /**
+   * Reachability tracking. `reachable` mirrors what HomeKit currently shows; it flips to false only
+   * after {@link UNREACHABLE_PROBE_THRESHOLD} consecutive liveness probes go unanswered, and back to
+   * true on the first successful probe or inbound frame. See {@link probe} / {@link registerHit}.
+   */
+  private reachable = true;
+  private consecutiveMisses = 0;
 
   /** True while a level write is debouncing or its update-suppression window is still open. */
   private get levelWriteInFlight(): boolean {
@@ -201,27 +210,29 @@ export class EchonetLightAccessory {
 
     this.platform.log.debug(`${ACTOR.HOMEBRIDGE} [${source}] -> ${name} reading device state`);
 
-    const [statusEdt, levelEdt] = await Promise.all([
-      this.read(EPC.OPERATION_STATUS),
-      this.isDimmable ? this.read(EPC.ILLUMINANCE_LEVEL) : Promise.resolve(undefined),
-    ]);
-
-    if (statusEdt !== undefined) {
-      const on = statusEdt.toLowerCase() === EDT_ON;
-      if (this.applyOn(on, source)) {
-        this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} state set to ${on ? 'ON' : 'OFF'}`);
-      }
-    } else {
+    // OPERATION_STATUS (0x80) is the liveness signal — mandatory on every lighting class — so it
+    // drives the reachability accounting. A silent device skips value application entirely.
+    const statusEdt = await this.probe(EPC.OPERATION_STATUS);
+    if (statusEdt === undefined) {
       this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} no response for OPERATION_STATUS`);
+      return;
+    }
+    const on = statusEdt.toLowerCase() === EDT_ON;
+    if (this.applyOn(on, source)) {
+      this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} state set to ${on ? 'ON' : 'OFF'}`);
     }
 
-    if (levelEdt !== undefined) {
-      const level = edtToLevel(levelEdt);
-      if (this.applyLevel(level, source)) {
-        this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} brightness set to ${level}%`);
+    if (this.isDimmable) {
+      // Brightness is a value sync only; the status probe above already settled reachability.
+      const levelEdt = await this.probe(EPC.ILLUMINANCE_LEVEL, false);
+      if (levelEdt !== undefined) {
+        const level = edtToLevel(levelEdt);
+        if (this.applyLevel(level, source)) {
+          this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} brightness set to ${level}%`);
+        }
+      } else {
+        this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} no response for ILLUMINANCE_LEVEL`);
       }
-    } else if (this.isDimmable) {
-      this.platform.log.debug(`${ACTOR.ECHONET} [${source}] -> ${name} no response for ILLUMINANCE_LEVEL`);
     }
   }
 
@@ -230,6 +241,8 @@ export class EchonetLightAccessory {
     if (change.ip !== this.ctx.ip || change.eoj.toLowerCase() !== this.ctx.eoj.toLowerCase()) {
       return;
     }
+    // An inbound frame proves the device is alive — clears a stale Not Responding immediately.
+    this.registerHit();
     const name = this.accessory.displayName;
     const source: UpdateSource = 'notify';
     switch (change.epc) {
@@ -304,8 +317,14 @@ export class EchonetLightAccessory {
   }
 
   private async getOn(): Promise<CharacteristicValue> {
-    const edt = await this.read(EPC.OPERATION_STATUS);
-    return edt?.toLowerCase() === EDT_ON;
+    const edt = await this.probe(EPC.OPERATION_STATUS);
+    if (edt === undefined) {
+      this.throwIfUnreachable();
+      // Under the miss threshold: fall back to the last cached value so a single lost packet
+      // doesn't flap the tile.
+      return this.readCached(EPC.OPERATION_STATUS)?.toLowerCase() === EDT_ON;
+    }
+    return edt.toLowerCase() === EDT_ON;
   }
 
   private async setOn(value: CharacteristicValue) {
@@ -320,8 +339,13 @@ export class EchonetLightAccessory {
   }
 
   private async getBrightness(): Promise<CharacteristicValue> {
-    const edt = await this.read(EPC.ILLUMINANCE_LEVEL);
-    return edt ? edtToLevel(edt) : 0;
+    const edt = await this.probe(EPC.ILLUMINANCE_LEVEL);
+    if (edt === undefined) {
+      this.throwIfUnreachable();
+      const cached = this.readCached(EPC.ILLUMINANCE_LEVEL);
+      return cached ? edtToLevel(cached) : 0;
+    }
+    return edtToLevel(edt);
   }
 
   private async setBrightness(value: CharacteristicValue) {
@@ -337,8 +361,13 @@ export class EchonetLightAccessory {
   }
 
   private async getColorTemperature(): Promise<CharacteristicValue> {
-    const edt = await this.read(EPC.ILLUMINANCE_LEVEL);
-    return this.ctCurve.percentToMired(edt ? edtToLevel(edt) : 0);
+    const edt = await this.probe(EPC.ILLUMINANCE_LEVEL);
+    if (edt === undefined) {
+      this.throwIfUnreachable();
+      const cached = this.readCached(EPC.ILLUMINANCE_LEVEL);
+      return this.ctCurve.percentToMired(cached ? edtToLevel(cached) : 0);
+    }
+    return this.ctCurve.percentToMired(edtToLevel(edt));
   }
 
   private async setColorTemperature(value: CharacteristicValue) {
@@ -376,8 +405,82 @@ export class EchonetLightAccessory {
     }, LEVEL_WRITE_DEBOUNCE_MS);
   }
 
-  private read(epc: string): Promise<string | undefined> {
-    return this.platform.client.getProperty(this.ctx.ip, this.ctx.eoj, epc);
+  /**
+   * Fresh on-the-wire read (bypasses the client cache) that resolves `undefined` when the device
+   * stays silent. When `track` is set (the default) the result feeds reachability accounting.
+   */
+  private async probe(epc: string, track = true): Promise<string | undefined> {
+    const edt = await this.platform.client.getProperty(this.ctx.ip, this.ctx.eoj, epc, 1500, { forceRefresh: true });
+    if (track) {
+      if (edt === undefined) {
+        this.registerMiss();
+      } else {
+        this.registerHit();
+      }
+    }
+    return edt;
+  }
+
+  private readCached(epc: string): string | undefined {
+    return this.platform.client.getCached(this.ctx.ip, this.ctx.eoj, epc);
+  }
+
+  /** A successful probe or inbound frame: reset the miss count and clear any Not Responding state. */
+  private registerHit(): void {
+    this.consecutiveMisses = 0;
+    if (!this.reachable) {
+      this.markReachable();
+    }
+  }
+
+  /** A silent probe: once the threshold is crossed, flip the accessory to Not Responding. */
+  private registerMiss(): void {
+    this.consecutiveMisses++;
+    if (this.reachable && this.consecutiveMisses >= UNREACHABLE_PROBE_THRESHOLD) {
+      this.markUnreachable();
+    }
+  }
+
+  private throwIfUnreachable(): void {
+    if (!this.reachable) {
+      throw this.commError();
+    }
+  }
+
+  private commError(): Error {
+    const { HapStatusError, HAPStatus } = this.platform.api.hap;
+    return new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+  }
+
+  /** Push a communication error to the interactive characteristics so HomeKit shows Not Responding. */
+  private markUnreachable(): void {
+    this.reachable = false;
+    this.platform.log.warn(
+      `${this.accessory.displayName} is not responding (${this.consecutiveMisses} consecutive probes unanswered)`,
+    );
+    const { Characteristic } = this.platform;
+    this.service.getCharacteristic(Characteristic.On).updateValue(this.commError());
+    if (this.isDimmable) {
+      this.service.getCharacteristic(Characteristic.Brightness).updateValue(this.commError());
+    }
+    if (this.hasColorTemperature) {
+      this.service.getCharacteristic(Characteristic.ColorTemperature).updateValue(this.commError());
+    }
+  }
+
+  /** Clear Not Responding by pushing the last-known values back to HomeKit. */
+  private markReachable(): void {
+    this.reachable = true;
+    this.platform.log.info(`${this.accessory.displayName} is responding again`);
+    const { Characteristic } = this.platform;
+    const on = this.readCached(EPC.OPERATION_STATUS)?.toLowerCase() === EDT_ON;
+    this.service.updateCharacteristic(Characteristic.On, on);
+    if (this.isDimmable) {
+      const levelEdt = this.readCached(EPC.ILLUMINANCE_LEVEL);
+      const level = levelEdt ? edtToLevel(levelEdt) : 0;
+      this.service.updateCharacteristic(Characteristic.Brightness, level);
+      this.syncColorTemperature(level);
+    }
   }
 
   private write(epc: string, edt: string) {

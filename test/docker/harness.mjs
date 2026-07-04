@@ -114,6 +114,16 @@ async function main() {
   });
   check('E. out-of-band ON change delivered via INF subscription', await infReceived);
 
+  // --- Test F: liveness probe (forceRefresh bypasses cache; silence => undefined) ---
+  // This is the primitive behind HomeKit "Not Responding": the accessory probes on the wire and
+  // treats a timeout as a real miss, rather than falling back to the never-invalidated cache.
+  const freshOn = await client.getProperty(ip, EOJ, EPC.OPERATION_STATUS, 2000, { forceRefresh: true });
+  check('F1. forceRefresh probe returns a fresh value from a live device', freshOn?.toLowerCase() === '30', `edt=${freshOn}`);
+
+  const DEAD_IP = process.env.DEAD_IP ?? '172.20.0.99';
+  const deadProbe = await client.getProperty(DEAD_IP, EOJ, EPC.OPERATION_STATUS, 1200, { forceRefresh: true });
+  check('F2. forceRefresh probe against a silent device resolves undefined', deadProbe === undefined, `got=${deadProbe}`);
+
   client.stop();
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);

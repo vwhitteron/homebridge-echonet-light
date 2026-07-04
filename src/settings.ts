@@ -62,6 +62,9 @@ export const DEFAULT_INITIAL_SCAN_DELAY_MS = 1000;
  */
 export const UPDATE_SETTLE_MS = 2500;
 
+/** Consecutive failed liveness probes before an accessory is marked Not Responding in HomeKit. */
+export const UNREACHABLE_PROBE_THRESHOLD = 3;
+
 /**
  * Colour-temperature curve breakpoints. Colour temperature is a HomeKit-only relationship derived
  * from brightness (the lamp manages its own colour temperature internally); it is not backed by any
