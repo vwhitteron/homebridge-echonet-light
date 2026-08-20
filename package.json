@@ -2,7 +2,7 @@
   "name": "homebridge-echonet-light",
   "displayName": "ECHONET Light",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": false,
   "description": "A Homebridge plugin for controlling ECHONET Lite lighting devices.",
   "author": "Vaughan Whitteron",
